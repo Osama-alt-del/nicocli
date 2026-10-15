@@ -152,6 +152,150 @@ def parse_video_id(text):
     return f"sm{text.strip()}" if text.strip().isdigit() else None
 
 
+# ─────────────────────────── comments ──────────────────────────
+
+# name -> (256-colour index, basic curses colour, dim?)
+COLOR_NAMES = {
+    "white": (15, -1), "red": (196, curses.COLOR_RED), "pink": (211, curses.COLOR_MAGENTA),
+    "orange": (208, curses.COLOR_YELLOW), "yellow": (226, curses.COLOR_YELLOW),
+    "green": (46, curses.COLOR_GREEN), "cyan": (51, curses.COLOR_CYAN),
+    "blue": (33, curses.COLOR_BLUE), "purple": (135, curses.COLOR_MAGENTA),
+    "black": (244, -1), "white2": (187, -1), "niconicowhite": (187, -1),
+    "red2": (124, curses.COLOR_RED), "truered": (124, curses.COLOR_RED),
+    "pink2": (207, curses.COLOR_MAGENTA), "orange2": (172, curses.COLOR_YELLOW),
+    "passionorange": (172, curses.COLOR_YELLOW), "yellow2": (142, curses.COLOR_YELLOW),
+    "madyellow": (142, curses.COLOR_YELLOW), "green2": (35, curses.COLOR_GREEN),
+    "elementalgreen": (35, curses.COLOR_GREEN), "cyan2": (37, curses.COLOR_CYAN),
+    "blue2": (26, curses.COLOR_BLUE), "marineblue": (26, curses.COLOR_BLUE),
+    "purple2": (97, curses.COLOR_MAGENTA), "nobleviolet": (97, curses.COLOR_MAGENTA),
+    "black2": (240, -1),
+}
+HEX_RE = re.compile(r"#[0-9a-fA-F]{6}")
+SCROLL_TIME = 4.0   # seconds a scrolling (naka) comment spends crossing the screen
+FIXED_TIME = 3.0    # seconds an ue/shita comment stays put
+
+
+class Comment:
+    __slots__ = ("vpos", "start", "end", "lines", "text", "width", "pos", "color",
+                 "fork", "big", "posted", "no")
+
+    def __init__(self, raw, fork):
+        self.vpos = (raw.get("vposMs") or 0) / 1000
+        body = clean(raw.get("body") or "", keep_newlines=True)
+        self.lines = [ln.rstrip() for ln in body.split("\n")] or [""]
+        while len(self.lines) > 1 and not self.lines[-1]:
+            self.lines.pop()
+        self.text = " ".join(ln.strip() for ln in self.lines)
+        self.width = max(1, max(swidth(ln) for ln in self.lines))
+        self.fork = fork
+        self.pos, self.color, self.big = "naka", None, False
+        for cmd in raw.get("commands") or []:
+            if cmd in ("ue", "shita", "naka"):
+                self.pos = cmd
+            elif cmd in COLOR_NAMES or HEX_RE.fullmatch(cmd):
+                self.color = cmd
+            elif cmd == "big":
+                self.big = True
+        if self.pos == "naka":
+            self.start, self.end = self.vpos - 1.0, self.vpos + SCROLL_TIME - 1.0
+        else:
+            self.start, self.end = self.vpos, self.vpos + FIXED_TIME
+        self.posted = raw.get("postedAt") or ""
+        self.no = raw.get("no") or 0
+
+
+def fetch_comments(info):
+    nv = (info.get("comment") or {}).get("nvComment")
+    if not nv:
+        return []
+    d = http_json(nv["server"].rstrip("/") + "/v1/threads",
+                  body={"params": nv["params"], "threadKey": nv["threadKey"],
+                        "additionals": {}})
+    out = []
+    for th in d.get("data", {}).get("threads", []):
+        for c in th.get("comments", []):
+            if (c.get("score") or 0) <= -4800:   # niconico's own NG-score filter
+                continue
+            out.append(Comment(c, th.get("fork", "main")))
+    out.sort(key=lambda c: c.vpos)
+    return out
+
+
+class Danmaku:
+    """Lays comments out in lanes and tells you where each one is at time t."""
+
+    def __init__(self, comments):
+        self.cs = sorted(comments, key=lambda c: c.start)
+        self.starts = [c.start for c in self.cs]
+        self.W = self.H = 0
+        self.t = -1e9
+        self.active = []
+
+    def reset(self, t, W, H):
+        self.W, self.H = W, H
+        self.naka = [None] * H          # per lane: (start, speed, width) of the last comment
+        self.fixed = [0.0] * H          # per lane: time the ue/shita comment there expires
+        self.active = []
+        self.idx = bisect.bisect_left(self.starts, t - SCROLL_TIME)
+        self.t = t
+
+    def advance(self, t, W, H):
+        if (W, H) != (self.W, self.H) or t < self.t or t - self.t > 2.0:
+            self.reset(t, W, H)
+        while self.idx < len(self.cs) and self.starts[self.idx] <= t:
+            c = self.cs[self.idx]
+            self.idx += 1
+            if c.end > t and H > 0:
+                self.spawn(c)
+        self.active = [a for a in self.active if a[0].end > t]
+        self.t = t
+
+    def _naka_free(self, lane, s, v):
+        prev = self.naka[lane]
+        if prev is None:
+            return True
+        ps, pv, pw = prev
+        pe = ps + SCROLL_TIME
+        if pe <= s:
+            return True
+        if self.W - pv * (s - ps) + pw >= self.W:      # previous hasn't fully entered yet
+            return False
+        return self.W - v * (pe - s) >= 1              # we won't catch up before it leaves
+
+    def spawn(self, c):
+        rows = min(len(c.lines), self.H)
+        span = range(self.H - rows + 1)
+        if c.pos == "naka":
+            v = (self.W + c.width) / SCROLL_TIME
+            lane = next((ln for ln in span
+                         if all(self._naka_free(i, c.start, v) for i in range(ln, ln + rows))),
+                        None)
+            if lane is None:
+                lane = random.choice(span)
+            for i in range(lane, lane + rows):
+                self.naka[i] = (c.start, v, c.width)
+            self.active.append((c, lane, v))
+        else:
+            order = span if c.pos == "ue" else reversed(span)
+            lane = next((ln for ln in order
+                         if all(self.fixed[i] <= c.start for i in range(ln, ln + rows))), None)
+            if lane is None:
+                lane = random.choice(span)
+            for i in range(lane, lane + rows):
+                self.fixed[i] = c.end
+            self.active.append((c, lane, 0))
+
+    def placements(self, t):
+        """Yield (comment, row, col) for everything on screen, naka first."""
+        fixed = []
+        for c, lane, v in self.active:
+            if c.pos == "naka":
+                yield c, lane, int(round(self.W - v * (t - c.start)))
+            else:
+                fixed.append((c, lane, (self.W - c.width) // 2))
+        yield from fixed
+
+
 # ─────────────────────────── text utils ────────────────────────
 
 def cw(ch):
