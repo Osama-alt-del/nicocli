@@ -296,6 +296,81 @@ class Danmaku:
         yield from fixed
 
 
+# ───────────────────────── mpv bridge ──────────────────────────
+
+class Mpv:
+    """Runs mpv in its own window and talks to it over its JSON IPC socket."""
+
+    def __init__(self, url, title):
+        self.path = os.path.join(tempfile.gettempdir(), f"nicocli-mpv-{os.getpid()}.sock")
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+        self.proc = subprocess.Popen(
+            ["mpv", "--force-window=immediate", "--no-terminal", f"--title={title}",
+             f"--input-ipc-server={self.path}", url],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        self.sock, self.buf, self.rid = None, b"", 0
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def _connect(self):
+        if self.sock is None and os.path.exists(self.path):
+            try:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.settimeout(0.25)
+                s.connect(self.path)
+                self.sock = s
+            except OSError:
+                pass
+        return self.sock is not None
+
+    def command(self, *args):
+        if not self._connect():
+            return None
+        self.rid += 1
+        try:
+            self.sock.sendall(json.dumps({"command": list(args), "request_id": self.rid})
+                              .encode() + b"\n")
+            while True:
+                while b"\n" in self.buf:
+                    line, self.buf = self.buf.split(b"\n", 1)
+                    try:
+                        msg = json.loads(line)
+                    except ValueError:
+                        continue
+                    if msg.get("request_id") == self.rid:
+                        return msg
+                chunk = self.sock.recv(65536)
+                if not chunk:
+                    raise OSError("closed")
+                self.buf += chunk
+        except OSError:
+            self.sock, self.buf = None, b""
+            return None
+
+    def get(self, prop):
+        r = self.command("get_property", prop)
+        return r.get("data") if r and r.get("error") == "success" else None
+
+    def close(self):
+        if self.alive():
+            self.command("quit")
+            try:
+                self.proc.wait(1)
+            except subprocess.TimeoutExpired:
+                self.proc.terminate()
+        if self.sock:
+            self.sock.close()
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+
+def have_streamer():
+    return shutil.which("yt-dlp") or shutil.which("youtube-dl")
+
+
 # ─────────────────────────── text utils ────────────────────────
 
 def cw(ch):
@@ -362,3 +437,26 @@ def fmt_time(sec):
 
 def fmt_date(iso):
     return iso[:16].replace("T", " ") if iso else "?"
+
+
+# ─────────────────────────── history ───────────────────────────
+
+HIST_PATH = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                         "nicocli", "history.json")
+
+
+def load_history():
+    try:
+        with open(HIST_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def save_history(hist):
+    try:
+        os.makedirs(os.path.dirname(HIST_PATH), exist_ok=True)
+        with open(HIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(hist[:300], f, ensure_ascii=False)
+    except OSError:
+        pass
