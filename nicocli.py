@@ -63,6 +63,17 @@ SORTS = [("-viewCounter", "most viewed"), ("-startTime", "newest"),
          ("-lengthSeconds", "longest")]
 
 
+REASONS = {
+    "DOMESTIC_VIDEO": "region-locked: only viewable from inside Japan",
+    "PPV_VIDEO": "pay-per-view video",
+    "CHANNEL_MEMBER_ONLY": "channel members only",
+    "PREMIUM_ONLY": "premium members only",
+    "HIDDEN_VIDEO": "private video",
+    "DELETED_VIDEO": "video was deleted",
+    "NOT_FOUND": "not found",
+}
+
+
 class NicoError(Exception):
     pass
 
@@ -81,8 +92,11 @@ def http_json(url, params=None, body=None, timeout=15):
             return json.load(r)
     except urllib.error.HTTPError as e:
         try:
-            meta = json.load(e).get("meta", {})
-            code = meta.get("errorCode") or meta.get("errorMessage")
+            err = json.load(e)
+            meta = err.get("meta", {})
+            code = (err.get("data") or {}).get("reasonCode") or meta.get("errorCode") \
+                or meta.get("errorMessage")
+            code = REASONS.get(code, code)
         except Exception:
             code = None
         raise NicoError(f"HTTP {e.code}" + (f" ({code})" if code else "")) from None
@@ -891,9 +905,7 @@ class App:
         try:
             info = watch_info(vid)
         except NicoError as e:
-            self.alert(f"Couldn't open {vid}:\n{e}\n\n"
-                       "(Some videos — paid channel content, deleted or private\n"
-                       " videos — can't be viewed without logging in.)")
+            self.alert(f"Couldn't open {vid}:\n{e}")
             return
         v = info["video"]
         cnt = v.get("count") or {}
